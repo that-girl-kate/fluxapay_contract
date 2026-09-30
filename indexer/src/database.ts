@@ -6,6 +6,7 @@
 
 import { Pool } from "pg";
 import { AnyEvent } from "./types";
+import { setCachedRate } from "./fx-rate-cache";
 
 export interface DLQRecord {
   id: number;
@@ -89,6 +90,9 @@ export class Database {
 
       // Store in type-specific table
       await this.storeTypedEvent(table, event, client);
+
+      // Issue #839: keep an in-memory FX rate cache for /v1/fx/convert.
+      this.updateFxRateCache(event);
 
       await client.query("COMMIT");
       return true;
@@ -238,13 +242,14 @@ export class Database {
 
       case "stream_withdrawals":
         await client.query(
-          `INSERT INTO stream_withdrawals (stream_id, recipient, amount, remaining_deposit, created_at)
-           VALUES ($1, $2, $3, $4, to_timestamp($5))`,
+          `INSERT INTO stream_withdrawals (stream_id, recipient, amount, remaining_deposit, memo, created_at)
+           VALUES ($1, $2, $3, $4, $5, to_timestamp($6))`,
           [
             value.stream_id || (Array.isArray(value) ? value[0] : null),
             value.recipient || value.destination || value.receiver || (Array.isArray(value) ? value[2] || value[1] : null),
             value.amount || value.withdrawable || (Array.isArray(value) ? value[3] : null),
             value.remaining_deposit || (Array.isArray(value) ? value[4] : null),
+            value.memo !== undefined ? value.memo : null,
             event.timestamp,
           ]
         );
@@ -310,6 +315,21 @@ export class Database {
       INVOICE: "invoices",
     };
     return tableMap[eventType] || "contract_events";
+  }
+
+  /**
+   * Issue #839: Mirror oracle rate events into the in-memory convert cache.
+   * Accepts both `FX_ORACLE` and `ORACLE` topic prefixes and pair formats
+   * like `USDC/NGN` or `USDC_NGN`.
+   */
+  private updateFxRateCache(event: AnyEvent): void {
+    const [eventType] = event.topic;
+    if (eventType !== "FX_ORACLE" && eventType !== "ORACLE") return;
+    const value = event.value as { asset?: string; pair?: string; rate?: number };
+    const rawPair = (value.asset || value.pair || "").toString();
+    if (!rawPair || typeof value.rate !== "number" || !Number.isFinite(value.rate)) return;
+    const pair = rawPair.replace("/", "_").toUpperCase();
+    setCachedRate(pair, value.rate, event.timestamp || Math.floor(Date.now() / 1000));
   }
 
   // ── Read queries (Issue #616 REST API Backing Queries) ─────────────────
